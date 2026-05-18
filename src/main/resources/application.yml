@@ -1,0 +1,109 @@
+server:
+  port: 8080
+
+jwt:
+  secret: dGhpc0lzU2VjdXJlS2V5Rm9ySldUQXV0aGVudGljYXRpb25TZXJ2aWNlRm9ySW52ZW50b3J5TWFuYWdlbWVudFNlcnZpY2U=
+  expiration: 86400000
+
+spring:
+  application:
+    name: api-gateway
+
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true
+      routes:
+        - id: auth-service
+          uri: lb://auth-service
+          predicates:
+            - Path=/auth/**
+
+        - id: product-service
+          uri: lb://inventory-service
+          predicates:
+            - Path=/products/**
+
+        - id: warehouse-service
+          uri: lb://inventory-service
+          predicates:
+            - Path=/warehouses/**
+
+        - id: stock-service-route
+          uri: lb://inventory-service
+          predicates:
+            - Path=/stock/**
+
+        - id: purchase-service
+          uri: lb://purchase-service
+          predicates:
+            - Path=/purchase-orders/**
+
+        - id: supplier-service
+          uri: lb://inventory-service
+          predicates:
+            - Path=/suppliers/**
+
+        - id: movement-service
+          uri: lb://inventory-service
+          predicates:
+            - Path=/movements/**
+
+        - id: alert-service
+          uri: lb://analytics-service
+          predicates:
+            - Path=/alerts/**
+
+        - id: report-service
+          uri: lb://analytics-service
+          predicates:
+            - Path=/reports/**
+
+        - id: audit-service
+          uri: lb://analytics-service
+          predicates:
+            - Path=/audit/**
+
+      globalcors:
+        corsConfigurations:
+          '[/**]':
+            allowedOrigins:
+              - "http://localhost:5173"
+              - "http://localhost:5174"
+              - "http://127.0.0.1:5173"
+              - "http://127.0.0.1:5174"
+            allowedMethods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - PATCH
+            allowedHeaders:
+              - "*"
+            allowCredentials: true
+            maxAge: 3600
+
+eureka:
+  client:
+    register-with-eureka: true
+    fetch-registry: true
+    service-url:
+      defaultZone: http://localhost:8761/eureka
+  instance:
+    prefer-ip-address: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    org.springframework.cloud.gateway: INFO
+    com.stockpro.gateway: INFO
