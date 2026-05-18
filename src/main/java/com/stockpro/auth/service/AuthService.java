@@ -21,6 +21,9 @@ public interface AuthService {
     UserResponse deactivateUser(Long userId);
 
     UserResponse activateUser(Long userId);
+
+    UserResponse updateUser(Long userId, UpdateUserRequest request);
+
     void deleteUser(Long userId);
 
     List<UserResponse> getAllUsers();
@@ -28,6 +31,8 @@ public interface AuthService {
     void logout(String token);
 
     void verifyEmail(String token);
+
+    void resendVerificationEmail(String email);
 
     boolean validateToken(String token);
 

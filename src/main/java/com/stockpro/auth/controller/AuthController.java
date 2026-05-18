@@ -1,6 +1,8 @@
 package com.stockpro.auth.controller;
 
 import com.stockpro.auth.dto.*;
+import com.stockpro.common.dto.ApiResponse;
+import com.stockpro.common.exception.BadRequestException;
 import com.stockpro.auth.entity.Role;
 import com.stockpro.auth.security.CustomUserDetailsService;
 import com.stockpro.auth.service.AuthService;
@@ -59,6 +61,13 @@ public class AuthController {
     public ResponseEntity<ApiResponse<Void>> verifyEmail(@RequestParam String token) {
         authService.verifyEmail(token);
         return ResponseEntity.ok(ApiResponse.success("Email verified successfully", null));
+    }
+
+    @PostMapping("/resend-verification")
+    @Operation(summary = "Resend verification email")
+    public ResponseEntity<ApiResponse<Void>> resendVerification(@RequestParam String email) {
+        authService.resendVerificationEmail(email);
+        return ResponseEntity.ok(ApiResponse.success("Verification email resent successfully", null));
     }
 
     @GetMapping("/profile")
@@ -125,6 +134,14 @@ public class AuthController {
         return ResponseEntity.ok(ApiResponse.success("User activated successfully", response));
     }
 
+    @PutMapping("/users/{userId}")
+    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    @Operation(summary = "Update user (Admin only)")
+    public ResponseEntity<ApiResponse<UserResponse>> updateUser(@PathVariable Long userId, @Valid @RequestBody com.stockpro.auth.dto.UpdateUserRequest request) {
+        UserResponse response = authService.updateUser(userId, request);
+        return ResponseEntity.ok(ApiResponse.success("User updated successfully", response));
+    }
+
     @DeleteMapping("/users/{userId}")
     @PreAuthorize("hasAuthority('ROLE_ADMIN')")
     @Operation(summary = "Delete user (Admin only)")
@@ -159,7 +176,7 @@ public class AuthController {
             JwtResponse response = authService.refreshToken(token.substring(7));
             return ResponseEntity.ok(ApiResponse.success(response));
         }
-        throw new com.stockpro.auth.exception.BadRequestException("Invalid token");
+        throw new BadRequestException("Invalid token");
     }
 
     private String getCurrentUserEmail() {

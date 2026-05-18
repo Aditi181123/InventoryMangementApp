@@ -15,17 +15,20 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import java.util.UUID;
 import jakarta.mail.internet.MimeMessage;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Value;
 
 import com.stockpro.auth.dto.ChangePasswordRequest;
 import com.stockpro.auth.dto.CreateUserRequest;
 import com.stockpro.auth.dto.JwtResponse;
 import com.stockpro.auth.dto.LoginRequest;
 import com.stockpro.auth.dto.UpdateProfileRequest;
+import com.stockpro.auth.dto.UpdateUserRequest;
 import com.stockpro.auth.dto.UserResponse;
 import com.stockpro.auth.entity.Role;
 import com.stockpro.auth.entity.User;
-import com.stockpro.auth.exception.BadRequestException;
-import com.stockpro.auth.exception.ResourceNotFoundException;
+import com.stockpro.common.exception.BadRequestException;
+import com.stockpro.common.exception.ResourceNotFoundException;
 import com.stockpro.auth.repository.UserRepository;
 import com.stockpro.auth.security.JwtUtil;
 
@@ -39,13 +42,34 @@ public class AuthServiceImpl implements AuthService {
     private final JwtUtil jwtUtil;
     private final AuthenticationManager authenticationManager;
     private final JavaMailSender mailSender;
+    private final RabbitTemplate rabbitTemplate;
+    private final com.stockpro.common.client.AuditClient auditClient;
 
-    public AuthServiceImpl(UserRepository userRepository, PasswordEncoder passwordEncoder, JwtUtil jwtUtil, AuthenticationManager authenticationManager, JavaMailSender mailSender) {
+    @Value("${spring.mail.username}")
+    private String mailUsername;
+
+    public AuthServiceImpl(UserRepository userRepository, PasswordEncoder passwordEncoder, JwtUtil jwtUtil, AuthenticationManager authenticationManager, JavaMailSender mailSender, RabbitTemplate rabbitTemplate, com.stockpro.common.client.AuditClient auditClient) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtUtil = jwtUtil;
         this.authenticationManager = authenticationManager;
         this.mailSender = mailSender;
+        this.rabbitTemplate = rabbitTemplate;
+        this.auditClient = auditClient;
+    }
+
+    private void logAudit(String username, String action, String resource, String resourceId, String details) {
+        try {
+            java.util.Map<String, Object> log = new java.util.HashMap<>();
+            log.put("username", username);
+            log.put("action", action);
+            log.put("resource", resource);
+            log.put("resourceId", resourceId);
+            log.put("details", details);
+            auditClient.logAction(log);
+        } catch (Exception e) {
+            logger.warn("Failed to log audit action: {}", e.getMessage());
+        }
     }
 
     @Override
@@ -53,7 +77,8 @@ public class AuthServiceImpl implements AuthService {
     public UserResponse createUser(CreateUserRequest request) {
         logger.info("Admin creating new user with email: {}", request.getEmail());
 
-        if (userRepository.existsByEmail(request.getEmail())) {
+        // Only block if an active (non-deleted) user already has this email
+        if (userRepository.findByEmail(request.getEmail()).map(u -> !Boolean.TRUE.equals(u.getIsDeleted())).orElse(false)) {
             throw new BadRequestException("Email already exists: " + request.getEmail());
         }
 
@@ -85,11 +110,12 @@ public class AuthServiceImpl implements AuthService {
             MimeMessage message = mailSender.createMimeMessage();
             MimeMessageHelper helper = new MimeMessageHelper(message, true);
 
-            helper.setFrom("system@stockpro.internal");
+            helper.setFrom(mailUsername);
             helper.setTo(user.getEmail());
             helper.setSubject("Verify your StockPro Account");
 
-            String verificationLink = "http://localhost:5173/verify-email?token=" + user.getVerificationToken();
+            String frontendUrl = System.getenv("FRONTEND_URL") != null ? System.getenv("FRONTEND_URL") : "http://localhost:5173";
+            String verificationLink = frontendUrl + "/verify-email?token=" + user.getVerificationToken();
             
             String content = String.format(
                 "<h3>Welcome to StockPro, %s!</h3>" +
@@ -103,10 +129,31 @@ public class AuthServiceImpl implements AuthService {
             );
 
             helper.setText(content, true);
-            mailSender.send(message);
-            logger.info("Verification email sent to: {}", user.getEmail());
+            
+            try {
+                mailSender.send(message);
+                logger.info("Verification email sent to: {}", user.getEmail());
+            } catch (Exception mailEx) {
+                logger.error("Failed to send real email (SMTP error): {}", mailEx.getMessage(), mailEx);
+            }
+
+            // Send to RabbitMQ for the local mock inbox service
+            try {
+                java.util.Map<String, Object> emailData = new java.util.HashMap<>();
+                emailData.put("recipientEmail", user.getEmail());
+                emailData.put("title", "Verify your StockPro Account");
+                emailData.put("message", String.format("Welcome %s! Click the link below to verify your account:\n\n %s", user.getFullName(), verificationLink));
+                emailData.put("severity", "INFO");
+                emailData.put("type", "VERIFICATION");
+                
+                rabbitTemplate.convertAndSend("stockpro.alerts", emailData);
+                logger.info("Verification notification sent to Mock Inbox (RabbitMQ) for: {}", user.getEmail());
+            } catch (Exception amqpEx) {
+                logger.error("Failed to send to RabbitMQ: {}", amqpEx.getMessage());
+            }
+
         } catch (Exception e) {
-            logger.error("Failed to send verification email to: {}", user.getEmail(), e);
+            logger.error("Error in verification email process for: {}", user.getEmail(), e);
         }
     }
 
@@ -130,7 +177,7 @@ public class AuthServiceImpl implements AuthService {
         }
 
         if (!user.getIsEmailVerified()) {
-            throw new BadRequestException("Email not verified. Please check your inbox.");
+            throw new BadRequestException("Email not verified. Please check your email inbox.");
         }
 
         user.setLastLoginAt(LocalDateTime.now());
@@ -138,6 +185,8 @@ public class AuthServiceImpl implements AuthService {
 
         String token = jwtUtil.generateToken(user.getEmail(), user.getUserId(), user.getRole().name());
         logger.info("User logged in successfully: {}", user.getEmail());
+
+        logAudit(user.getEmail(), "USER_LOGIN", "AUTH", user.getUserId().toString(), "Login successful");
 
         return JwtResponse.builder()
                 .token(token)
@@ -173,10 +222,7 @@ public class AuthServiceImpl implements AuthService {
         if (request.getPhone() != null) {
             user.setPhone(request.getPhone());
         }
-        if (request.getDepartment() != null) {
-            user.setDepartment(request.getDepartment());
-        }
-
+         
         userRepository.save(user);
         logger.info("Profile updated for user: {}", email);
 
@@ -208,6 +254,8 @@ public class AuthServiceImpl implements AuthService {
         userRepository.save(user);
         logger.info("User deactivated: {}", userId);
 
+        logAudit("ADMIN", "DEACTIVATE_USER", "USER", userId.toString(), "User deactivated: " + user.getEmail());
+
         return mapToUserResponse(user);
     }
 
@@ -220,6 +268,44 @@ public class AuthServiceImpl implements AuthService {
         user.setIsActive(true);
         userRepository.save(user);
         logger.info("User activated: {}", userId);
+
+        return mapToUserResponse(user);
+    }
+
+    @Override
+    @Transactional
+    public UserResponse updateUser(Long userId, UpdateUserRequest request) {
+        logger.info("Admin updating user with ID: {}", userId);
+
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with ID: " + userId));
+
+        if (request.getFullName() != null) {
+            user.setFullName(request.getFullName());
+        }
+        if (request.getEmail() != null && !request.getEmail().equals(user.getEmail())) {
+            if (userRepository.existsByEmail(request.getEmail())) {
+                throw new BadRequestException("Email already exists: " + request.getEmail());
+            }
+            user.setEmail(request.getEmail());
+        }
+        if (request.getPassword() != null && !request.getPassword().isBlank()) {
+            user.setPasswordHash(passwordEncoder.encode(request.getPassword()));
+        }
+        if (request.getPhone() != null) {
+            user.setPhone(request.getPhone());
+        }
+        if (request.getRole() != null) {
+            user.setRole(request.getRole());
+        }
+        if (request.getDepartment() != null) {
+            user.setDepartment(request.getDepartment());
+        }
+
+        userRepository.save(user);
+        logger.info("User updated successfully with ID: {}", userId);
+
+        logAudit("ADMIN", "UPDATE_USER", "USER", userId.toString(), "User details updated: " + user.getEmail());
 
         return mapToUserResponse(user);
     }
@@ -247,8 +333,7 @@ public class AuthServiceImpl implements AuthService {
 
     @Override
     public void logout(String token) {
-        logger.info("User logout requested");
-        // Token blacklisting would happen here if implemented with Redis
+        logger.info("User logout requested"); 
     }
 
     @Override
@@ -264,6 +349,29 @@ public class AuthServiceImpl implements AuthService {
         user.setVerificationToken(null);
         userRepository.save(user);
         logger.info("Email verified successfully for user: {}", user.getEmail());
+    }
+
+    @Override
+    @Transactional
+    public void resendVerificationEmail(String email) {
+        logger.info("Request to resend verification email for: {}", email);
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with email: " + email));
+
+        if (user.getIsEmailVerified()) {
+            throw new BadRequestException("Email is already verified");
+        }
+
+        if (Boolean.TRUE.equals(user.getIsDeleted())) {
+            throw new BadRequestException("This account has been deleted");
+        }
+
+        String newVerificationToken = UUID.randomUUID().toString();
+        user.setVerificationToken(newVerificationToken);
+        userRepository.save(user);
+
+        logger.info("Generated new verification token for user: {}. Resending email.", email);
+        sendVerificationEmail(user);
     }
 
     @Override
